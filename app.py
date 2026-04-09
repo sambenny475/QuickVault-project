@@ -1,7 +1,5 @@
-from importlib.resources import files
-
 from flask import Flask, flash, render_template, request, redirect, session, send_from_directory
-import sqlite3
+import psycopg2
 import os
 from werkzeug.utils import secure_filename
 
@@ -11,37 +9,40 @@ app.secret_key = "secret123"
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 
 def get_db():
-    return sqlite3.connect('vault.db')
+    return psycopg2.connect(DATABASE_URL)
 
 
-# Create tables
+# 🔥 INIT DB
 def init_db():
     conn = get_db()
+    cur = conn.cursor()
 
-    conn.execute('''
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        phone TEXT,
+        id SERIAL PRIMARY KEY,
+        phone TEXT UNIQUE,
         password TEXT
     )
-    ''')
+    """)
 
-    conn.execute('''
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS files (
-        id INTEGER PRIMARY KEY,
+        id SERIAL PRIMARY KEY,
         user_id INTEGER,
         filename TEXT
     )
-    ''')
+    """)
 
+    conn.commit()
+    cur.close()
     conn.close()
 
 
-init_db()
-
-
+# 🔥 REGISTER
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
@@ -49,20 +50,26 @@ def register():
         password = request.form['password']
 
         conn = get_db()
-        conn.execute(
-            "INSERT INTO users (phone, password) VALUES (?, ?)",
-            (phone, password)
-        )
-        conn.commit()
+        cur = conn.cursor()
+
+        try:
+            cur.execute(
+                "INSERT INTO users (phone, password) VALUES (%s, %s)",
+                (phone, password)
+            )
+            conn.commit()
+        except:
+            flash("User already exists")
+
+        cur.close()
         conn.close()
 
         return redirect('/')
 
     return render_template('register.html')
 
-# LOGIN
 
-
+# 🔐 LOGIN
 @app.route('/', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -70,83 +77,97 @@ def login():
         password = request.form['password']
 
         conn = get_db()
-        user = conn.execute(
-            "SELECT * FROM users WHERE phone=?",
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT * FROM users WHERE phone=%s",
             (phone,)
-        ).fetchone()
+        )
+
+        user = cur.fetchone()
+
+        cur.close()
+        conn.close()
 
         if user:
             if user[2] == password:
                 session['user_id'] = user[0]
-                conn.close()
                 return redirect('/dashboard')
             else:
-                conn.close()
-                flash("wrong password")
-                return redirect('/')
+                flash("Wrong password")
         else:
-            conn.close()
             flash("User not found")
-            return redirect('/')
+
+        return redirect('/')
 
     return render_template('login.html')
 
 
-#  DASHBOARD
+# 📁 DASHBOARD
 @app.route('/dashboard')
 def dashboard():
     if 'user_id' not in session:
         return redirect('/')
 
     conn = get_db()
-    files = conn.execute(
-        "SELECT * FROM files WHERE user_id=?",
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM files WHERE user_id=%s",
         (session['user_id'],)
-    ).fetchall()
+    )
+
+    files = cur.fetchall()
+
+    cur.close()
     conn.close()
 
     return render_template('dashboard.html', files=files)
 
 
-# UPLOAD
+# 📤 UPLOAD
 @app.route('/upload', methods=['POST'])
 def upload():
     if 'user_id' not in session:
         return redirect('/')
 
     files = request.files.getlist('file')
+
     conn = get_db()
+    cur = conn.cursor()
 
     for file in files:
         if file and file.filename != "":
             filename = secure_filename(file.filename)
 
-            # CHECK DUPLICATE IN DB
-            existing = conn.execute(
-                "SELECT * FROM files WHERE user_id=? AND filename=?",
+            # 🔥 CHECK DUPLICATE
+            cur.execute(
+                "SELECT * FROM files WHERE user_id=%s AND filename=%s",
                 (session['user_id'], filename)
-            ).fetchone()
+            )
+            existing = cur.fetchone()
 
             if existing:
                 flash(f"{filename} already exists")
-                continue  # skip duplicate
+                continue
 
             # Save file
             file.save(os.path.join(UPLOAD_FOLDER, filename))
 
             # Save in DB
-            conn.execute(
-                "INSERT INTO files (user_id, filename) VALUES (?, ?)",
+            cur.execute(
+                "INSERT INTO files (user_id, filename) VALUES (%s, %s)",
                 (session['user_id'], filename)
             )
 
     conn.commit()
+    cur.close()
     conn.close()
 
     return redirect('/dashboard')
 
 
-# DOWNLOAD
+# 📥 DOWNLOAD
 @app.route('/files/<filename>')
 def files(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
@@ -156,29 +177,34 @@ def files(filename):
 @app.route('/delete/<int:file_id>')
 def delete(file_id):
     conn = get_db()
+    cur = conn.cursor()
 
-    file = conn.execute(
-        "SELECT filename FROM files WHERE id=?",
+    cur.execute(
+        "SELECT filename FROM files WHERE id=%s",
         (file_id,)
-    ).fetchone()
+    )
+    file = cur.fetchone()
 
     if file:
         filepath = os.path.join(UPLOAD_FOLDER, file[0])
 
-        # Delete file from folder safely
         if os.path.exists(filepath):
             os.remove(filepath)
 
-        # ALWAYS delete from DB
-        conn.execute(
-            "DELETE FROM files WHERE id=?",
+        cur.execute(
+            "DELETE FROM files WHERE id=%s",
             (file_id,)
         )
         conn.commit()
-    print("Deleting:", files)
+
+    cur.close()
     conn.close()
+
     return redirect('/dashboard')
 
+
+# 🔥 RUN INIT
+init_db()
 
 if __name__ == '__main__':
     app.run(debug=True)
